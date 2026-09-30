@@ -8,13 +8,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .errors import DomainError, ValidationError
+from .errors import DomainError
+from .funding_service import FundingService
 from .service import DomainService
 from .storage import Database
 
 
+def _receipt_response(receipt: Any) -> tuple[int, dict[str, Any]]:
+    data = receipt.__dict__ if hasattr(receipt, "__dict__") else receipt
+    return (200 if data["replayed"] else 201), data
+
+
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          funding: FundingService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -26,18 +33,15 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
         if method == "POST" and parsed.path == "/organizations":
-            receipt = service.register_organization(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _receipt_response(service.register_organization(actor_id=actor_id, **body))
         if method == "POST" and parsed.path == "/actors":
-            receipt = service.register_actor(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _receipt_response(service.register_actor(actor_id=actor_id, **body))
         if method == "POST" and parsed.path == "/sites":
-            receipt = service.register_site(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _receipt_response(service.register_site(actor_id=actor_id, **body))
         if method == "POST" and parsed.path == "/domain-records":
-            receipt = service.record_domain_data(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return _receipt_response(service.record_domain_data(actor_id=actor_id, **body))
         if method == "GET" and parsed.path == "/domain-records":
+            from .errors import ValidationError
             query = parse_qs(parsed.query)
             site_id = query.get("site_id", [""])[0]
             if not site_id:
@@ -48,17 +52,70 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if funding is not None:
+            result = funding_route(funding, method, parsed.path, parsed.query, body, actor_id)
+            if result is not None:
+                return result
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
+        if exc.args and isinstance(exc.args[0], dict):
+            return exc.status, {"error": exc.code, "message": exc.args[0].get("message", str(exc)),
+                                "details": exc.args[0]}
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def funding_route(funding: FundingService, method: str, path: str, query_string: str,
+                  body: dict[str, Any], actor_id: str):
+    """分派养护资金决策与执行相关路由。"""
+
+    query = parse_qs(query_string)
+
+    def q(name: str) -> str:
+        return query.get(name, [""])[0]
+
+    if method == "POST":
+        routes_post = {
+            "/funding/segments": funding.register_segment,
+            "/funding/evidence": funding.add_evidence,
+            "/funding/policies": funding.register_policy,
+            "/funding/rounds": funding.create_round,
+            "/funding/envelopes": funding.set_envelope,
+            "/funding/applications": funding.submit_application,
+            "/funding/freeze": funding.freeze_round,
+            "/funding/decide": funding.decide_portfolio,
+            "/funding/emergency-review": funding.submit_emergency_review,
+            "/funding/payments": funding.pay_milestone,
+            "/funding/changes": funding.change_project,
+            "/funding/cancellations": funding.cancel_project,
+            "/funding/recoveries": funding.recover_funds,
+            "/funding/periods/open": funding.open_period,
+            "/funding/periods/close": funding.close_period,
+        }
+        handler = routes_post.get(path)
+        if handler is not None:
+            return _receipt_response(handler(actor_id=actor_id, **body))
+    if method == "GET":
+        if path == "/funding/conflicts":
+            return 200, funding.detect_conflicts(actor_id, q("round_id"))
+        if path == "/funding/rounds":
+            return 200, funding.get_round(actor_id, q("round_id"))
+        if path == "/funding/portfolio":
+            return 200, funding.get_portfolio(actor_id, q("round_id"))
+        if path == "/funding/trace":
+            return 200, funding.get_trace(actor_id, q("application_id"))
+        if path == "/funding/simulate":
+            return 200, funding.simulate_policy(actor_id=actor_id, round_id=q("round_id"),
+                                                policy_version=q("policy_version"))
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    funding: FundingService | None = None
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +126,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                funding=self.funding)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -93,13 +151,14 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     """启动本地 HTTP 服务。"""
 
-    parser = argparse.ArgumentParser(description="启动技能赛训协作基础服务")
+    parser = argparse.ArgumentParser(description="启动综合交通协同服务（含养护资金决策）")
     parser.add_argument("--database", default="service.sqlite3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.funding = FundingService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
